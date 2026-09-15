@@ -1,0 +1,441 @@
+"""
+arduino_cli_ide.py
+Code Editor Python (Tkinter) untuk menulis sketch Arduino (C++)
+dan compile/upload BENERAN lewat arduino-cli.
+
+Syarat:
+- arduino-cli sudah terinstall (sudo pacman -S arduino-cli)
+- Core board sudah terinstall (arduino-cli core install arduino:avr)
+
+Aturan folder sketch Arduino:
+- File .ino HARUS berada di dalam folder dengan nama yang SAMA PERSIS
+  Contoh: folder "hi-there/" berisi file "hi-there.ino"
+- Kalau kalian bikin sketch baru lewat editor ini, folder itu otomatis dibuatkan.
+
+Jalankan dengan:
+    python arduino_cli_ide.py
+"""
+
+import tkinter as tk
+from tkinter import filedialog, simpledialog, messagebox, font
+import subprocess
+import os
+import re
+
+# ============================================================
+# KONFIGURASI DEFAULT (bisa diubah lewat menu Tools)
+# ============================================================
+DEFAULT_FQBN = "arduino:avr:uno"   # Fully Qualified Board Name
+DEFAULT_PORT = "/dev/ttyACM0"      # ganti sesuai hasil `arduino-cli board list`
+
+# ============================================================
+# WARNA TEMA
+# ============================================================
+WARNA_BG_EDITOR = "#1e1e1e"
+WARNA_BG_TOOLBAR = "#2d2d2d"
+WARNA_BG_OUTPUT = "#000000"
+WARNA_TEKS = "#d4d4d4"
+WARNA_ACCENT = "#00a5a5"
+WARNA_KEYWORD = "#569cd6"
+WARNA_TIPE = "#4ec9b0"
+WARNA_STRING = "#ce9178"
+WARNA_COMMENT = "#6a9955"
+WARNA_FUNGSI = "#dcdcaa"
+
+CPP_KEYWORDS = [
+    "void", "int", "float", "double", "char", "bool", "byte", "long",
+    "unsigned", "const", "static", "return", "if", "else", "for",
+    "while", "do", "switch", "case", "break", "continue", "struct",
+    "class", "public", "private", "true", "false", "define", "include"
+]
+ARDUINO_FUNGSI_BAWAAN = [
+    "setup", "loop", "digitalWrite", "digitalRead", "analogWrite",
+    "analogRead", "pinMode", "delay", "Serial"
+]
+
+
+class ArduinoCliIDE:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("untitled | Arduino CLI Editor")
+        self.root.geometry("1000x700")
+        self.root.configure(bg=WARNA_BG_TOOLBAR)
+
+        self.sketch_folder = None   # folder tempat file .ino berada
+        self.ino_path = None        # path lengkap file .ino
+        self.fqbn = DEFAULT_FQBN
+        self.port = DEFAULT_PORT
+        self.font_editor = font.Font(family="Consolas", size=12)
+
+        self._buat_menu()
+        self._buat_toolbar()
+        self._buat_tab_bar()
+        self._buat_editor()
+        self._buat_output()
+        self._buat_status_bar()
+        self._buat_shortcut()
+
+    # ========================================================
+    # MENU BAR
+    # ========================================================
+    def _buat_menu(self):
+        menubar = tk.Menu(self.root)
+
+        menu_file = tk.Menu(menubar, tearoff=0)
+        menu_file.add_command(label="New Sketch...", command=self.sketch_baru, accelerator="Ctrl+N")
+        menu_file.add_command(label="Open Sketch...", command=self.sketch_buka, accelerator="Ctrl+O")
+        menu_file.add_command(label="Save", command=self.sketch_simpan, accelerator="Ctrl+S")
+        menu_file.add_separator()
+        menu_file.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=menu_file)
+
+        menu_edit = tk.Menu(menubar, tearoff=0)
+        menu_edit.add_command(label="Undo", command=self.text_area_undo, accelerator="Ctrl+Z")
+        menu_edit.add_command(label="Cut", command=lambda: self.text_area.event_generate("<<Cut>>"))
+        menu_edit.add_command(label="Copy", command=lambda: self.text_area.event_generate("<<Copy>>"))
+        menu_edit.add_command(label="Paste", command=lambda: self.text_area.event_generate("<<Paste>>"))
+        menubar.add_cascade(label="Edit", menu=menu_edit)
+
+        menu_sketch = tk.Menu(menubar, tearoff=0)
+        menu_sketch.add_command(label="Verify/Compile", command=self.verify_kode, accelerator="Ctrl+R")
+        menu_sketch.add_command(label="Upload", command=self.upload_kode, accelerator="Ctrl+U")
+        menubar.add_cascade(label="Sketch", menu=menu_sketch)
+
+        menu_tools = tk.Menu(menubar, tearoff=0)
+        menu_tools.add_command(label="Set Board (FQBN)...", command=self.set_fqbn)
+        menu_tools.add_command(label="Set Port...", command=self.set_port)
+        menu_tools.add_command(label="List Connected Boards", command=self.list_boards)
+        menubar.add_cascade(label="Tools", menu=menu_tools)
+
+        self.root.config(menu=menubar)
+
+    # ========================================================
+    # TOOLBAR
+    # ========================================================
+    def _buat_toolbar(self):
+        toolbar = tk.Frame(self.root, bg=WARNA_BG_TOOLBAR, height=45)
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+
+        tk.Button(
+            toolbar, text="✓", font=("Arial", 14, "bold"), fg="white",
+            bg="#3c3c3c", activebackground="#505050", border=0, width=3,
+            command=self.verify_kode
+        ).pack(side=tk.LEFT, padx=(10, 2), pady=5)
+
+        tk.Button(
+            toolbar, text="→", font=("Arial", 14, "bold"), fg="white",
+            bg="#3c3c3c", activebackground="#505050", border=0, width=3,
+            command=self.upload_kode
+        ).pack(side=tk.LEFT, padx=2, pady=5)
+
+        self.label_board = tk.Label(
+            toolbar, text=self.fqbn, fg="white", bg=WARNA_ACCENT,
+            font=("Arial", 10, "bold"), padx=10, pady=3
+        )
+        self.label_board.pack(side=tk.LEFT, padx=10)
+
+    def _buat_tab_bar(self):
+        self.tab_frame = tk.Frame(self.root, bg="#252525", height=28)
+        self.tab_frame.pack(fill=tk.X)
+        self.label_tab = tk.Label(
+            self.tab_frame, text="untitled.ino", fg="white", bg="#252525",
+            font=("Arial", 10), anchor="w", padx=10, pady=4
+        )
+        self.label_tab.pack(side=tk.LEFT)
+
+    # ========================================================
+    # EDITOR
+    # ========================================================
+    def _buat_editor(self):
+        container = tk.PanedWindow(self.root, orient=tk.VERTICAL, bg=WARNA_BG_TOOLBAR)
+        container.pack(fill=tk.BOTH, expand=True)
+        self.editor_container = container
+
+        editor_frame = tk.Frame(container)
+        container.add(editor_frame, height=420)
+
+        self.line_numbers = tk.Text(
+            editor_frame, width=4, padx=4, takefocus=0, border=0,
+            background="#2b2b2b", foreground="#858585",
+            state="disabled", font=self.font_editor
+        )
+        self.line_numbers.pack(side=tk.LEFT, fill=tk.Y)
+
+        self.text_area = tk.Text(
+            editor_frame, wrap="none", undo=True,
+            background=WARNA_BG_EDITOR, foreground=WARNA_TEKS,
+            insertbackground="white", font=self.font_editor, border=0
+        )
+        self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar_y = tk.Scrollbar(editor_frame, command=self._scroll_sync)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_area.config(yscrollcommand=scrollbar_y.set)
+
+        self.text_area.tag_configure("keyword", foreground=WARNA_KEYWORD)
+        self.text_area.tag_configure("string", foreground=WARNA_STRING)
+        self.text_area.tag_configure("comment", foreground=WARNA_COMMENT)
+        self.text_area.tag_configure("fungsi", foreground=WARNA_FUNGSI)
+
+        self.text_area.bind("<KeyRelease>", self._on_key_release)
+        self.text_area.bind("<MouseWheel>", self._update_line_numbers)
+        self.text_area.bind("<ButtonRelease-1>", self._update_status_bar)
+
+        # Template kosong awal (setup & loop) biar familiar
+        self.text_area.insert("1.0", "void setup() {\n  \n}\n\nvoid loop() {\n  \n}\n")
+        self._update_line_numbers()
+        self._highlight_syntax()
+
+    def _scroll_sync(self, *args):
+        self.text_area.yview(*args)
+        self.line_numbers.yview(*args)
+
+    def _on_key_release(self, event=None):
+        self._update_line_numbers()
+        self._highlight_syntax()
+        self._update_status_bar()
+
+    def _update_line_numbers(self, event=None):
+        jumlah_baris = int(self.text_area.index("end-1c").split(".")[0])
+        teks_nomor = "\n".join(str(i) for i in range(1, jumlah_baris + 1))
+        self.line_numbers.config(state="normal")
+        self.line_numbers.delete("1.0", "end")
+        self.line_numbers.insert("1.0", teks_nomor)
+        self.line_numbers.config(state="disabled")
+        self.line_numbers.yview_moveto(self.text_area.yview()[0])
+
+    def _highlight_syntax(self):
+        for tag in ("keyword", "string", "fungsi", "comment"):
+            self.text_area.tag_remove(tag, "1.0", tk.END)
+
+        isi = self.text_area.get("1.0", tk.END)
+
+        for kw in CPP_KEYWORDS:
+            for match in re.finditer(rf"\b{kw}\b", isi):
+                self.text_area.tag_add("keyword", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+        for kw in ARDUINO_FUNGSI_BAWAAN:
+            for match in re.finditer(rf"\b{kw}\b", isi):
+                self.text_area.tag_add("fungsi", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+        for match in re.finditer(r"(\".*?\")", isi):
+            self.text_area.tag_add("string", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+        for match in re.finditer(r"//.*", isi):
+            self.text_area.tag_add("comment", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+    # ========================================================
+    # OUTPUT PANEL
+    # ========================================================
+    def _buat_output(self):
+        output_frame = tk.Frame(self.editor_container)
+        self.editor_container.add(output_frame, height=220)
+
+        header = tk.Frame(output_frame, bg="#2d2d2d")
+        header.pack(fill=tk.X)
+        tk.Label(
+            header, text="Output", fg="white", bg="#2d2d2d",
+            font=("Arial", 10), anchor="w", padx=8, pady=3
+        ).pack(side=tk.LEFT)
+
+        self.output_console = tk.Text(
+            output_frame, background=WARNA_BG_OUTPUT, foreground="#00ff90",
+            font=("Consolas", 10), state="disabled"
+        )
+        self.output_console.pack(fill=tk.BOTH, expand=True)
+
+    def _tulis_output(self, teks, bersihkan=False):
+        self.output_console.config(state="normal")
+        if bersihkan:
+            self.output_console.delete("1.0", tk.END)
+        self.output_console.insert(tk.END, teks)
+        self.output_console.see(tk.END)
+        self.output_console.config(state="disabled")
+
+    def _buat_status_bar(self):
+        self.status_bar = tk.Label(
+            self.root, text="Ln 1, Col 0", fg="white", bg=WARNA_ACCENT,
+            font=("Arial", 9), anchor="e", padx=10
+        )
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _update_status_bar(self, event=None):
+        baris, kolom = self.text_area.index(tk.INSERT).split(".")
+        info_port = f" | {self.port}" if self.port else ""
+        self.status_bar.config(text=f"Ln {baris}, Col {kolom}{info_port}")
+
+    def _buat_shortcut(self):
+        self.root.bind("<Control-n>", lambda e: self.sketch_baru())
+        self.root.bind("<Control-o>", lambda e: self.sketch_buka())
+        self.root.bind("<Control-s>", lambda e: self.sketch_simpan())
+        self.root.bind("<Control-r>", lambda e: self.verify_kode())
+        self.root.bind("<Control-u>", lambda e: self.upload_kode())
+
+    def text_area_undo(self):
+        try:
+            self.text_area.edit_undo()
+        except tk.TclError:
+            pass
+
+    # ========================================================
+    # MANAJEMEN SKETCH (folder + file .ino harus sama nama)
+    # ========================================================
+    def sketch_baru(self):
+        nama = simpledialog.askstring("Sketch Baru", "Nama sketch (tanpa spasi):")
+        if not nama:
+            return
+        lokasi_induk = filedialog.askdirectory(title="Pilih lokasi untuk folder sketch")
+        if not lokasi_induk:
+            return
+
+        folder_sketch = os.path.join(lokasi_induk, nama)
+        os.makedirs(folder_sketch, exist_ok=True)
+        self.sketch_folder = folder_sketch
+        self.ino_path = os.path.join(folder_sketch, f"{nama}.ino")
+
+        self.text_area.delete("1.0", tk.END)
+        self.text_area.insert("1.0", "void setup() {\n  \n}\n\nvoid loop() {\n  \n}\n")
+        self._highlight_syntax()
+        self._update_line_numbers()
+        self._simpan_file()
+        self._update_title()
+        self._tulis_output(f"[INFO] Sketch baru dibuat: {self.ino_path}\n")
+
+    def sketch_buka(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Arduino Sketch", "*.ino")]
+        )
+        if not path:
+            return
+        self.ino_path = path
+        self.sketch_folder = os.path.dirname(path)
+        with open(path, "r", encoding="utf-8") as f:
+            isi = f.read()
+        self.text_area.delete("1.0", tk.END)
+        self.text_area.insert("1.0", isi)
+        self._highlight_syntax()
+        self._update_line_numbers()
+        self._update_title()
+
+    def sketch_simpan(self):
+        if not self.ino_path:
+            self.sketch_baru()
+        else:
+            self._simpan_file()
+            self._tulis_output(f"[INFO] Disimpan: {self.ino_path}\n")
+
+    def _simpan_file(self):
+        if self.ino_path:
+            with open(self.ino_path, "w", encoding="utf-8") as f:
+                f.write(self.text_area.get("1.0", tk.END))
+
+    def _update_title(self):
+        nama = os.path.basename(self.ino_path) if self.ino_path else "untitled.ino"
+        self.root.title(f"{nama} | Arduino CLI Editor")
+        self.label_tab.config(text=nama)
+
+    # ========================================================
+    # SETTING BOARD / PORT
+    # ========================================================
+    def set_fqbn(self):
+        nilai = simpledialog.askstring("Set Board (FQBN)", "Contoh: arduino:avr:uno", initialvalue=self.fqbn)
+        if nilai:
+            self.fqbn = nilai
+            self.label_board.config(text=self.fqbn)
+
+    def set_port(self):
+        nilai = simpledialog.askstring("Set Port", "Contoh: /dev/ttyACM0", initialvalue=self.port)
+        if nilai:
+            self.port = nilai
+            self._update_status_bar()
+
+    def list_boards(self):
+        self._tulis_output("Mencari board yang terhubung...\n", bersihkan=True)
+        self.root.update()
+        try:
+            hasil = subprocess.run(
+                ["arduino-cli", "board", "list"],
+                capture_output=True, text=True, timeout=20
+            )
+            self._tulis_output(hasil.stdout)
+            if hasil.stderr:
+                self._tulis_output(hasil.stderr)
+        except FileNotFoundError:
+            self._tulis_output("[ERROR] arduino-cli tidak ditemukan. Install dulu: sudo pacman -S arduino-cli\n")
+        except Exception as e:
+            self._tulis_output(f"[ERROR] {e}\n")
+
+    # ========================================================
+    # VERIFY / COMPILE (pakai arduino-cli compile)
+    # ========================================================
+    def verify_kode(self):
+        if not self._pastikan_sketch_siap():
+            return
+
+        self._tulis_output("Compiling sketch...\n", bersihkan=True)
+        self.root.update()
+
+        try:
+            hasil = subprocess.run(
+                ["arduino-cli", "compile", "--fqbn", self.fqbn, self.sketch_folder],
+                capture_output=True, text=True, timeout=120
+            )
+            self._tulis_output(hasil.stdout)
+            if hasil.stderr:
+                self._tulis_output(hasil.stderr)
+
+            if hasil.returncode == 0:
+                self._tulis_output("Done compiling.\n")
+            else:
+                self._tulis_output(f"[ERROR] Compile gagal (exit code {hasil.returncode})\n")
+        except FileNotFoundError:
+            self._tulis_output("[ERROR] arduino-cli tidak ditemukan. Install dulu: sudo pacman -S arduino-cli\n")
+        except subprocess.TimeoutExpired:
+            self._tulis_output("[ERROR] Compile timeout.\n")
+
+    # ========================================================
+    # UPLOAD (pakai arduino-cli upload, otomatis compile dulu)
+    # ========================================================
+    def upload_kode(self):
+        if not self._pastikan_sketch_siap():
+            return
+
+        self._tulis_output(f"Uploading ke {self.port} ({self.fqbn})...\n", bersihkan=True)
+        self.root.update()
+
+        try:
+            hasil = subprocess.run(
+                [
+                    "arduino-cli", "upload", "-p", self.port,
+                    "--fqbn", self.fqbn, self.sketch_folder
+                ],
+                capture_output=True, text=True, timeout=120
+            )
+            self._tulis_output(hasil.stdout)
+            if hasil.stderr:
+                self._tulis_output(hasil.stderr)
+
+            if hasil.returncode == 0:
+                self._tulis_output("Done uploading.\n")
+            else:
+                self._tulis_output(f"[ERROR] Upload gagal (exit code {hasil.returncode})\n")
+        except FileNotFoundError:
+            self._tulis_output("[ERROR] arduino-cli tidak ditemukan. Install dulu: sudo pacman -S arduino-cli\n")
+        except subprocess.TimeoutExpired:
+            self._tulis_output("[ERROR] Upload timeout.\n")
+
+    def _pastikan_sketch_siap(self):
+        if not self.ino_path:
+            messagebox.showinfo("Info", "Buat/simpan sketch dulu (File > New Sketch atau Ctrl+S).")
+            self.sketch_baru()
+            if not self.ino_path:
+                return False
+        else:
+            self._simpan_file()
+        return True
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ArduinoCliIDE(root)
+    root.mainloop()
