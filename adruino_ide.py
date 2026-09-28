@@ -21,6 +21,8 @@ from tkinter import filedialog, simpledialog, messagebox, font
 import subprocess
 import os
 import re
+import sys
+import shutil
 
 # ============================================================
 # KONFIGURASI DEFAULT (bisa diubah lewat menu Tools)
@@ -54,6 +56,29 @@ ARDUINO_FUNGSI_BAWAAN = [
 ]
 
 
+# ============================================================
+# HEX DUMP (bisa dipakai dari editor maupun dari terminal)
+# ============================================================
+MAX_TAMPIL_BYTE = 64 * 1024   # batas tampil di panel Output (file txt tetap penuh)
+
+
+def hex_dump(data, lebar=16):
+    """Ubah bytes jadi teks: offset | hex | ASCII, mirip perintah `xxd`/`hexdump -C`."""
+    baris = []
+    for i in range(0, len(data), lebar):
+        potongan = data[i:i + lebar]
+        hex_bagian = " ".join(f"{b:02X}" for b in potongan)
+        ascii_bagian = "".join(chr(b) if 32 <= b < 127 else "." for b in potongan)
+        baris.append(f"{i:08X}  {hex_bagian:<{lebar * 3 - 1}}  |{ascii_bagian}|")
+    return "\n".join(baris) + ("\n" if baris else "")
+
+
+def hex_dump_file(path, batas=None):
+    with open(path, "rb") as f:
+        data = f.read() if batas is None else f.read(batas)
+    return hex_dump(data)
+
+
 class ArduinoCliIDE:
     def __init__(self, root):
         self.root = root
@@ -65,6 +90,7 @@ class ArduinoCliIDE:
         self.ino_path = None        # path lengkap file .ino
         self.fqbn = DEFAULT_FQBN
         self.port = DEFAULT_PORT
+        self.hex_terakhir = None   # (nama_file, teks_hex_penuh)
         self.font_editor = font.Font(family="Consolas", size=12)
 
         self._buat_menu()
@@ -74,6 +100,7 @@ class ArduinoCliIDE:
         self._buat_output()
         self._buat_status_bar()
         self._buat_shortcut()
+        self._setup_clipboard()
 
     # ========================================================
     # MENU BAR
@@ -91,9 +118,10 @@ class ArduinoCliIDE:
 
         menu_edit = tk.Menu(menubar, tearoff=0)
         menu_edit.add_command(label="Undo", command=self.text_area_undo, accelerator="Ctrl+Z")
-        menu_edit.add_command(label="Cut", command=lambda: self.text_area.event_generate("<<Cut>>"))
-        menu_edit.add_command(label="Copy", command=lambda: self.text_area.event_generate("<<Copy>>"))
-        menu_edit.add_command(label="Paste", command=lambda: self.text_area.event_generate("<<Paste>>"))
+        menu_edit.add_command(label="Cut", command=lambda: self._potong(self.text_area), accelerator="Ctrl+X")
+        menu_edit.add_command(label="Copy", command=lambda: self._salin(self.text_area), accelerator="Ctrl+C")
+        menu_edit.add_command(label="Paste", command=lambda: self._tempel(self.text_area), accelerator="Ctrl+V")
+        menu_edit.add_command(label="Select All", command=lambda: self._pilih_semua(self.text_area), accelerator="Ctrl+A")
         menubar.add_cascade(label="Edit", menu=menu_edit)
 
         menu_sketch = tk.Menu(menubar, tearoff=0)
@@ -106,6 +134,12 @@ class ArduinoCliIDE:
         menu_tools.add_command(label="Set Port...", command=self.set_port)
         menu_tools.add_command(label="List Connected Boards", command=self.list_boards)
         menubar.add_cascade(label="Tools", menu=menu_tools)
+
+        menu_hex = tk.Menu(menubar, tearoff=0)
+        menu_hex.add_command(label="Lihat Hex File...", command=self.hex_buka_file, accelerator="Ctrl+H")
+        menu_hex.add_command(label="Hex Hasil Compile", command=self.hex_hasil_compile)
+        menu_hex.add_command(label="Simpan Hex ke .txt...", command=self.hex_simpan_txt)
+        menubar.add_cascade(label="Hex", menu=menu_hex)
 
         self.root.config(menu=menubar)
 
@@ -270,6 +304,7 @@ class ArduinoCliIDE:
         self.root.bind("<Control-s>", lambda e: self.sketch_simpan())
         self.root.bind("<Control-r>", lambda e: self.verify_kode())
         self.root.bind("<Control-u>", lambda e: self.upload_kode())
+        self.root.bind("<Control-h>", lambda e: self.hex_buka_file())
 
     def text_area_undo(self):
         try:
@@ -434,8 +469,213 @@ class ArduinoCliIDE:
             self._simpan_file()
         return True
 
+    # ========================================================
+    # FITUR HEX VIEWER
+    # ========================================================
+    def _tampilkan_hex(self, path):
+        """Baca file biner, tampilkan hex di panel Output, simpan versi penuh."""
+        ukuran = os.path.getsize(path)
+        teks_penuh = hex_dump_file(path)
+        self.hex_terakhir = (path, teks_penuh)
+
+        header = f"Hex dump: {path}  ({ukuran} byte)\n"
+        header += "OFFSET    00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F  ASCII\n"
+        self._tulis_output(header, bersihkan=True)
+        self._tulis_output(hex_dump_file(path, MAX_TAMPIL_BYTE))
+        if ukuran > MAX_TAMPIL_BYTE:
+            self._tulis_output(
+                f"\n... dipotong, tampil {MAX_TAMPIL_BYTE} dari {ukuran} byte. "
+                "Pakai Hex > Simpan Hex ke .txt untuk versi lengkap.\n"
+            )
+
+    def hex_buka_file(self):
+        path = filedialog.askopenfilename(title="Pilih file untuk dilihat hex-nya")
+        if path:
+            try:
+                self._tampilkan_hex(path)
+            except Exception as e:
+                self._tulis_output(f"[ERROR] {e}\n", bersihkan=True)
+
+    def hex_hasil_compile(self):
+        """Compile sketch, lalu tampilkan hex dari firmware hasil compile (.bin / .hex)."""
+        if not self._pastikan_sketch_siap():
+            return
+
+        folder_build = os.path.join(self.sketch_folder, "build")
+        self._tulis_output("Compiling sketch untuk hex dump...\n", bersihkan=True)
+        self.root.update()
+
+        try:
+            hasil = subprocess.run(
+                ["arduino-cli", "compile", "--fqbn", self.fqbn,
+                 "--output-dir", folder_build, self.sketch_folder],
+                capture_output=True, text=True, timeout=180
+            )
+        except FileNotFoundError:
+            self._tulis_output("[ERROR] arduino-cli tidak ditemukan.\n")
+            return
+        except subprocess.TimeoutExpired:
+            self._tulis_output("[ERROR] Compile timeout.\n")
+            return
+
+        if hasil.returncode != 0:
+            self._tulis_output(hasil.stdout + hasil.stderr)
+            self._tulis_output("[ERROR] Compile gagal, hex tidak bisa dibuat.\n")
+            return
+
+        nama = os.path.basename(self.ino_path)
+        kandidat = [
+            os.path.join(folder_build, nama + ".bin"),   # ESP32 (firmware aplikasi)
+            os.path.join(folder_build, nama + ".hex"),   # AVR (Uno/Nano)
+        ]
+        target = next((k for k in kandidat if os.path.exists(k)), None)
+        if not target:
+            self._tulis_output(f"[ERROR] File .bin/.hex tidak ditemukan di {folder_build}\n")
+            return
+        self._tampilkan_hex(target)
+
+    def hex_simpan_txt(self):
+        if not self.hex_terakhir:
+            path = filedialog.askopenfilename(title="Pilih file yang mau di-hex-dump ke .txt")
+            if not path:
+                return
+            self._tampilkan_hex(path)
+
+        sumber, teks = self.hex_terakhir
+        tujuan = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            initialfile=os.path.basename(sumber) + ".hex.txt",
+            filetypes=[("Text File", "*.txt")]
+        )
+        if tujuan:
+            with open(tujuan, "w", encoding="utf-8") as f:
+                f.write(teks)
+            self._tulis_output(f"\n[INFO] Hex lengkap disimpan: {tujuan}\n")
+
+    # ========================================================
+    # CLIPBOARD (copy/paste yang andal di Linux/Wayland)
+    # ========================================================
+    def _setup_clipboard(self):
+        for widget, bisa_edit in ((self.text_area, True), (self.output_console, False)):
+            # Klik = ambil fokus, supaya Ctrl+C bekerja juga di panel Output
+            widget.bind("<Button-1>", lambda e, w=widget: w.focus_set(), add="+")
+            widget.bind("<Button-3>", lambda e, w=widget, ed=bisa_edit: self._menu_klik_kanan(e, w, ed))
+
+            for tombol in ("<Control-c>", "<Control-C>", "<Control-Shift-C>", "<Control-Insert>"):
+                widget.bind(tombol, lambda e, w=widget: self._salin(w))
+            for tombol in ("<Control-a>", "<Control-A>"):
+                widget.bind(tombol, lambda e, w=widget: self._pilih_semua(w))
+
+            if bisa_edit:
+                for tombol in ("<Control-x>", "<Control-X>", "<Shift-Delete>"):
+                    widget.bind(tombol, lambda e, w=widget: self._potong(w))
+                for tombol in ("<Control-v>", "<Control-V>", "<Control-Shift-V>", "<Shift-Insert>"):
+                    widget.bind(tombol, lambda e, w=widget: self._tempel(w))
+
+    def _set_clipboard(self, teks):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(teks)
+        self.root.update()
+        # Di Wayland (Hyprland), sinkronkan juga ke clipboard sistem kalau wl-copy ada
+        if shutil.which("wl-copy"):
+            try:
+                p = subprocess.Popen(
+                    ["wl-copy"], stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                p.stdin.write(teks.encode("utf-8"))
+                p.stdin.close()
+            except Exception:
+                pass
+
+    def _ambil_clipboard(self):
+        if shutil.which("wl-paste"):
+            try:
+                hasil = subprocess.run(["wl-paste", "-n"], capture_output=True, timeout=2)
+                if hasil.returncode == 0 and hasil.stdout:
+                    return hasil.stdout.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _salin(self, widget):
+        try:
+            teks = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self._set_clipboard(teks)
+        return "break"
+
+    def _potong(self, widget):
+        try:
+            teks = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self._set_clipboard(teks)
+        widget.delete("sel.first", "sel.last")
+        self._on_key_release()
+        return "break"
+
+    def _tempel(self, widget):
+        teks = self._ambil_clipboard()
+        if not teks:
+            return "break"
+        try:
+            widget.delete("sel.first", "sel.last")   # ganti teks yang sedang diblok
+        except tk.TclError:
+            pass
+        widget.insert("insert", teks)
+        widget.see("insert")
+        self._on_key_release()
+        return "break"
+
+    def _pilih_semua(self, widget):
+        widget.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _menu_klik_kanan(self, event, widget, bisa_edit):
+        widget.focus_set()
+        menu = tk.Menu(self.root, tearoff=0)
+        if bisa_edit:
+            menu.add_command(label="Cut", command=lambda: self._potong(widget))
+        menu.add_command(label="Copy", command=lambda: self._salin(widget))
+        if bisa_edit:
+            menu.add_command(label="Paste", command=lambda: self._tempel(widget))
+        menu.add_separator()
+        menu.add_command(label="Select All", command=lambda: self._pilih_semua(widget))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+
+def mode_terminal(argv):
+    """python arduino_cli_ide.py --hex <file> [--out hasil.txt]"""
+    if len(argv) < 3:
+        print("Pemakaian: python arduino_cli_ide.py --hex <file> [--out hasil.txt]")
+        return 1
+    sumber = argv[2]
+    if not os.path.isfile(sumber):
+        print(f"File tidak ditemukan: {sumber}")
+        return 1
+    teks = hex_dump_file(sumber)
+    if "--out" in argv and argv.index("--out") + 1 < len(argv):
+        tujuan = argv[argv.index("--out") + 1]
+        with open(tujuan, "w", encoding="utf-8") as f:
+            f.write(teks)
+        print(f"Hex disimpan ke {tujuan}")
+    else:
+        print(teks, end="")
+    return 0
+
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--hex":
+        sys.exit(mode_terminal(sys.argv))
     root = tk.Tk()
     app = ArduinoCliIDE(root)
     root.mainloop()
