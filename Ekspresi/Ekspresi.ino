@@ -70,3 +70,6 @@ void setup() {
 void loop() {
   // Tidak ada yang perlu diulang, gambar tetap tampil.
 }
+
+
+

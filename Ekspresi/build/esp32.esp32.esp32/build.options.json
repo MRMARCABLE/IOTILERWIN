@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/brambang/.arduino15/packages/esp32/hardware/esp32/3.3.11,/home/brambang/.arduino15/packages/esp32/hardware/esp32/3.3.11",
+  "otherLibrariesFolders": "/home/brambang/Arduino/libraries",
+  "sketchLocation": "/home/brambang/Collage/semester-3/arsitektur_komputer/iot/IOTILERWIN/Ekspresi"
+}
