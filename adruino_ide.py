@@ -714,7 +714,7 @@ class ArduinoCliIDE:
         ta.bind("<Return>", self._on_return)
         ta.bind("<KP_Enter>", self._on_return)
         ta.bind("<Tab>", self._on_tab)
-        ta.bind("<ISO_Left_Tab>", self._on_shift_tab)
+        # ta.bind("<ISO_Left_Tab>", self._on_shift_tab)  # Disabled on Windows; use Shift-Tab binding instead
         ta.bind("<Shift-Tab>", self._on_shift_tab)
         for seq in ("<Control-Button-4>", "<Control-Button-5>", "<Control-MouseWheel>"):
             ta.bind(seq, self._on_ctrl_wheel)
